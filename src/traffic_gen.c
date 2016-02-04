@@ -17,6 +17,9 @@
 
 #define FNAME_SIZE	(155)
 #define LINE_SIZE	(1024 * 2)
+#define IPPROTO_UDP   17
+#define IPPROTO_TCP   6
+
 extern int _pcap_datalink_type;
 extern struct _pcaps pcaps;
 
@@ -45,6 +48,135 @@ extern char *optarg;  // Used by getopt.
 //globals for using napa cards
 NtNetStreamTx_t hNetTx;           			// Handle to the TX stream
 enum NtTxTimingMethod_e txTiming; 			// TX mode - Do we use absolut or relative mode
+
+
+/* Calculate the IP header checksum.
+ * *buf The IP header content.
+ * * hdr_len The IP header length.
+ * return The result of the checksum.
+ */
+uint16_t ip_checksum(void* vdata,size_t length) {
+    // Cast the data pointer to one that can be indexed.
+    char* data=(char*)vdata;
+
+    // Initialise the accumulator.
+    uint64_t acc=0xffff;
+
+    // Handle any partial block at the start of the data.
+    unsigned int offset=((uintptr_t)data)&3;
+    if (offset) {
+        size_t count=4-offset;
+        if (count>length) count=length;
+        uint32_t word=0;
+        memcpy(offset+(char*)&word,data,count);
+        acc+=ntohl(word);
+        data+=count;
+        length-=count;
+    }
+
+    // Handle any complete 32-bit blocks.
+    char* data_end=data+(length&~3);
+    while (data!=data_end) {
+        uint32_t word;
+        memcpy(&word,data,4);
+        acc+=ntohl(word);
+        data+=4;
+    }
+    length&=3;
+
+    // Handle any partial block at the end of the data.
+    if (length) {
+        uint32_t word=0;
+        memcpy(&word,data,length);
+        acc+=ntohl(word);
+    }
+
+    // Handle deferred carries.
+    acc=(acc&0xffffffff)+(acc>>32);
+    while (acc>>16) {
+        acc=(acc&0xffff)+(acc>>16);
+    }
+
+    // If the data began at an odd byte address
+    // then reverse the byte order to compensate.
+    if (offset&1) {
+        acc=((acc&0xff00)>>8)|((acc&0x00ff)<<8);
+    }
+//printf("acc = %d - %d - ", acc, htons(~acc));
+    // Return the checksum in network byte order.
+    return htons(~acc);
+}
+
+/*
+ * Calculate the UDP checksum (calculated with the whole packet).
+ * buff The UDP packet.
+ * len The UDP packet length.
+ * src_addr The IP source address (in network format).
+ * dest_addr The IP destination address (in network format).
+ * return The result of the checksum.
+ */
+uint16_t udp_checksum(const void *buff, size_t len, uint32_t src_addr, uint32_t dest_addr)
+{
+        const uint16_t *buf=buff;
+        uint16_t *ip_src=(void *)&src_addr, *ip_dst=(void *)&dest_addr;
+        uint32_t sum;
+        size_t length=len;
+
+        // Calculate the sum
+        sum = 0;
+        while (len > 1)
+        {
+                sum += *buf++;
+                if (sum & 0x80000000)
+                        sum = (sum & 0xFFFF) + (sum >> 16);
+                len -= 2;
+        }
+
+        if ( len & 1 )
+                 // Add the padding if the packet lenght is odd
+                 sum += *((uint8_t *)buf);
+
+         // Add the pseudo-header
+         sum += *(ip_src++);
+         sum += *ip_src;
+
+         sum += *(ip_dst++);
+         sum += *ip_dst;
+
+         sum += htons(IPPROTO_UDP);
+         sum += htons(length);
+
+         // Add the carries
+         while (sum >> 16)
+                 sum = (sum & 0xFFFF) + (sum >> 16);
+
+         // Return the one's complement of sum
+         return ( (uint16_t)(~sum)  );
+ }
+
+/*
+ * TCP Checksum
+ * buffer is containing all the octets in the TCP header and data.
+ * size is the length (number of octets) of the TCP header and data.
+ */
+unsigned short tcp_checksum(unsigned short *buffer, int size)
+{
+    unsigned long cksum=0;
+    while(size >1)
+    {
+        cksum+=*buffer++;
+        size -=sizeof(unsigned short);
+    }
+    if(size)
+        cksum += *(unsigned short*)buffer;
+
+    cksum = (cksum >> 16) + (cksum & 0xffff);
+    cksum += (cksum >>16);
+    return (unsigned short)(~cksum);
+}
+
+
+
 
 static void usage(void)
 {
@@ -195,6 +327,7 @@ void quit_handle(int dummy) {
 static void *generate_data (conf *traffic_conf)
 {
 	unsigned char *rb_obj;
+	static uint64_t ts;
 	uint32_t ip_increment = traffic_conf->start_ip;
 	uint32_t gtpu_ip_increment = traffic_conf->gtp_start_ip;
 	uint16_t port_increment = traffic_conf->start_port;
@@ -217,8 +350,6 @@ static void *generate_data (conf *traffic_conf)
 #endif
 
 	for (i = 0; keep_running; i++) {
-		static uint64_t ts=0;
-
 		if ((0 == pcaps.byte_count[i] || pcaps.byte_count[i] > LINE_SIZE) && i != pcaps.item_count)		continue;
 
 		if (i == pcaps.item_count) { //increase ip/port/gtp in every cycle of pcap
@@ -292,30 +423,142 @@ static void *generate_data (conf *traffic_conf)
  * offset + 26 = udp checksum
  * offset + 28 = udp payload (gtp)
  */
+			if (traffic_conf->gtpu_toggle && (IPPROTO_UDP == rb_obj[offset+9]) &&
+					((rb_obj[offset+28] & 0xE0) >> 5) && (0xFF == rb_obj[offset+29]) ) {
+				/*
+				 * offset + 28 = flags
+				 * offset + 29 = msgtype
+				 * offset + 30 & 31 = length
+				 * offset + 32 - 33 -34 -35 = teid
+				 * if (flags % 0x0F = 0) offset + 36 = start of ip layer
+				 * if (flags % 0x0F = 2) {
+				 * 	offset + 36 = seq number
+				 * 	offset + 38 = start of ip layer
+				 * }
+				 */
+				int ip_offset = (rb_obj[offset+28] & 0x0F);
+				if ( 0 == ip_offset || 2 == ip_offset) {
+//					uint32_t tmp_ip = 0;
+					// 12 byte offset into IP header for IP addresses
+					/* 2 byte boşluk bırakıyor eğer S flag set ise - onun hesabını yapalım hemen */
+					ip_offset *=2;
+					ip_offset += 12;
+					//change gtpu source ip adresses
+/* 					uint32_t tmp_ip = 0;
+ 	 	 	 	 	tmp_ip =  ntohl(*((uint32_t*)(rb_obj+offset+36+ip_offset)));
+					tmp_ip += gtpu_ip_increment;
+					*((uint32_t*) (rb_obj+offset+36+ip_offset)) = htonl(tmp_ip);
+*/
+					rb_obj[offset+36+ip_offset] = (rb_obj[offset+36+ip_offset] +
+										(gtpu_ip_increment >> 24) & 0xFF) % 0xFF;
+					rb_obj[offset+37+ip_offset] = (rb_obj[offset+37+ip_offset] +
+										(gtpu_ip_increment >> 16) & 0xFF) % 0xFF;
+					rb_obj[offset+38+ip_offset] = (rb_obj[offset+38+ip_offset] +
+										(gtpu_ip_increment >> 8) & 0xFF) % 0xFF;
+					rb_obj[offset+39+ip_offset] = (rb_obj[offset+39+ip_offset] +
+										(gtpu_ip_increment & 0xFF)) % 0xFF;
+					//change dst ip
+					rb_obj[offset+40+ip_offset] = (rb_obj[offset+40+ip_offset] +
+										(gtpu_ip_increment >> 24) & 0xFF) % 0xFF;
+					rb_obj[offset+41+ip_offset] = (rb_obj[offset+41+ip_offset] +
+										(gtpu_ip_increment >> 16) & 0xFF) % 0xFF;
+					rb_obj[offset+42+ip_offset] = (rb_obj[offset+42+ip_offset] +
+										(gtpu_ip_increment >> 8) & 0xFF) % 0xFF;
+					rb_obj[offset+43+ip_offset] = (rb_obj[offset+43+ip_offset] +
+										(gtpu_ip_increment & 0xFF)) % 0xFF;
+				}
+			}
+
+
+			//change ip checksum
+			if (traffic_conf->ip_checksum_toggle) {
+				int hdr_len = (rb_obj[offset] & 0x0F); // number of 32-bit words in the header
+				*((uint16_t*) (rb_obj + offset + 10)) = 0x0;
+				uint16_t chksm = ip_checksum((void *)(rb_obj + offset), hdr_len<<2);
+				*((uint16_t*) (rb_obj + offset + 10)) = chksm;
+			}
+
+			//change protocol checksum
+			if (traffic_conf->protocol_checksum_toggle) {
+				uint8_t proto = rb_obj[offset+9];
+				if (IPPROTO_TCP == proto) {
+					offset += 20; //+ 20 bytes for ip header
+					uint16_t chksm = tcp_checksum((unsigned short *) rb_obj+offset, pcaps.byte_count[i]-offset);
+					memcpy(rb_obj + offset + 10, &chksm, sizeof(uint16_t));
+
+				} else if (IPPROTO_UDP == proto) {
+					offset += 20; //+ 20 bytes for ip header
+					uint16_t udp_len = ntohs(*(uint16_t *)(rb_obj + offset + 4));
+					uint16_t chksm = udp_checksum(rb_obj+offset, udp_len, *(uint32_t *)(rb_obj + offset - 8), *(uint32_t *)(rb_obj + offset - 4));
+					memcpy(rb_obj + offset + 6, &chksm, sizeof(uint16_t));
+				}
+			}
+
+			if(firstPacket == 1) {
+			  if(txTiming == NT_TX_TIMING_ABSOLUTE) {
+				// Absolute TX mode is supported.
+				// If transmit tx relative is disabled i.e. we are using absolut transmit and
+				// the txclock must be synched to the timestamp in the first packet.
+				NT_NET_SET_PKT_TXNOW(hNetBufTx, 0);                    // Wait for tx delay before the packet is sent
+				NT_NET_SET_PKT_TXSETCLOCK(hNetBufTx, 1);               // Synchronize tx clock to timestamp in first packet.
+			  }
+			  else {
+				// Use Legacy mode/Relative tx timing.
+				// First packet must be sent with txnow=1
+				NT_NET_SET_PKT_TXNOW(hNetBufTx, 1);
+			  }
+			  firstPacket = 0;
+			}
+
+			ts=0;
+			// Calculate the timestamp
+			if( traffic_conf->bitrate ) {
+				ts += (((((uint64_t)LINE_SIZE+20)*8*1000))/ traffic_conf->bitrate);
+				ts = ((ts+9)/10)*10; // Round up to nearest 10
+			} else { //transmit at line rate
+				ts = 10;
+			}
+
+			// Set the timestamp of the TX packet
+			NT_NET_SET_PKT_TIMESTAMP(hNetBufTx, ts/10); //Time is in 10ns Ticks
+			// Ask for CRC calculation at tx
+			NT_NET_SET_PKT_RECALC_L2_CRC(hNetBufTx, 1);
+
+			// Release the TX buffer and the packet will be transmitted
+			if((status = NT_NetTxRelease(hNetTx, hNetBufTx)) != NT_SUCCESS) {
+			  // Get the status code as text
+			  NT_ExplainError(status, errorBuffer, sizeof(errorBuffer));
+			  fprintf(stderr, "NT_NetTxRelease() failed: %s\n", errorBuffer);
+			  return NULL;
+			}
 
 		}
 
-/* TODO LIST:
- * udp manipulation
- * gtp manipulation
- * cheksum calculation
- * try to arrange transmit rate
- * packet send
- */
-
-
+#ifdef BENCHMARK		//gigabit check
+		if (gb_bytes > GBIT_CHECK) {
+			clock_gettime(CLOCK_MONOTONIC, &tend);
+			printf("\nmore than 40 Gbit data pulled about %.5f seconds\n",
+							   ((double)tend.tv_sec + 1.0e-9*tend.tv_nsec) -
+							   ((double)tgb_start.tv_sec + 1.0e-9*tgb_start.tv_nsec));
+			tgb_start.tv_sec = tend.tv_sec; tgb_start.tv_nsec = tend.tv_nsec;
+			printf("%lu packets\n", gb_packet);
+			gb_bytes = 0; gb_packet = 0;
+			gbit++;
+			total_bytes %= GBIT_CHECK;
+		}
+#endif
 	}
 #ifdef BENCHMARK
 clock_gettime(CLOCK_MONOTONIC, &tend);
 printf("\n=====\tSTATS\t=====\n");
-printf("Packet Count\t:\t%u\n", packet_count);
-printf("Total Bytes\t:\t%u GBytes + ", gbit*5);
+printf("Packet Count\t:\t%lu\n", packet_count);
+printf("Total Bytes\t:\t%d GBytes + ", gbit*5);
 format_bytes(total_bytes);
 printf("\ntook about %.5f seconds\n",
 			   ((double)tend.tv_sec + 1.0e-9*tend.tv_nsec) -
 			   ((double)tstart.tv_sec + 1.0e-9*tstart.tv_nsec));
 #endif
-	return;
+	return NULL;
 }
 
 
