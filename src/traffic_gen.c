@@ -13,7 +13,10 @@
 #include <signal.h>
 //napatect api
 #include <nt.h>
-//#define BENCHMARK
+
+#include <time.h>
+#define BENCHMARK
+#define GBIT_CHECK ((1024UL * 1024UL * 1024UL *40UL) / 8UL)
 
 #define FNAME_SIZE	(155)
 #define LINE_SIZE	(1024 * 2)
@@ -324,6 +327,18 @@ void quit_handle(int dummy) {
     keep_running = 0;
 }
 
+void format_bytes(unsigned long number)
+{
+    char *suffix[3] = { "GB", "MB", "KB" };
+    int multiplier[3] = { 1024 * 1024 * 1024, 1024*1024, 1024 };
+    int i,j;
+    for(i=0; number > 1024; i++){
+    	printf("%d%s ", (int) (number/multiplier[i]) , suffix[i]);
+    	number %=  multiplier[i];
+    }
+    printf("%lu Bytes\n", number);
+}
+
 static void *generate_data (conf *traffic_conf)
 {
 	unsigned char *rb_obj;
@@ -384,7 +399,7 @@ static void *generate_data (conf *traffic_conf)
 		packet_count++; gb_packet++;
 		if (total_bytes + pcaps.byte_count[i] < ULONG_MAX ) total_bytes += pcaps.byte_count[i];
 		gb_bytes += pcaps.byte_count[i];
-		printf("byte_count =%d\n", 	pcaps.byte_count[i]);
+//		printf("byte_count =%d\n", 	pcaps.byte_count[i]);
 #endif
 
 		{ // algorithm to generate from template frame

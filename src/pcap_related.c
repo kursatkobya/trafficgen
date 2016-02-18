@@ -57,13 +57,13 @@ void save_frames (unsigned char *user, const struct pcap_pkthdr *hdr, const unsi
 
 	/*only for diagnostic
 	 * will be removed or commented out after saving to heap completed
-	 * */
-	printf("frame %d = [%d] ", pcaps.item_count, pcaps.byte_count[pcaps.item_count]);
+	 */
+/*	printf("frame %d = [%d] ", pcaps.item_count, pcaps.byte_count[pcaps.item_count]);
 	int kk;
 	for (kk=0; kk<pcaps.byte_count[pcaps.item_count]; kk++)
 		printf(" 0x%x", pcaps.item[pcaps.item_count][kk]);
 	printf("\n\n");
-	/* end of diagnostic*/
+	 /*end of diagnostic*/
 
 	pcaps.item_count++;
 }
